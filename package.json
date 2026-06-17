@@ -1,0 +1,27 @@
+{
+  "name": "dvenue-clientbackend",
+  "version": "1.0.0",
+  "description": "Client-only backend for Dvenue. Limited surface for clients: listings (view/submit own), bookings (view/create/pay), profile, auth. Read/write isolation for security. Use main backend/ for admin/staff operations.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "npx nodemon index.js",
+    "test": "node --test test/*.test.js",
+    "test:watch": "node --test --watch test/*.test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.2.0",
+    "firebase-admin": "^12.1.0",
+    "helmet": "^7.1.0",
+    "node-fetch": "^3.3.2",
+    "sharp": "^0.33.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
