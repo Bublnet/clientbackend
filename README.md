@@ -46,8 +46,16 @@ All previous security (rate limit, helmet, requirePremiumOrAd for reads, require
 - Server (image-processor.js) handles early downsample for huge originals (5–50MB+), then produces:
   - HD: ~1600px max, high visual quality (mozjpeg q82) — full-HD look at small size.
   - Thumb: 480px, tiny for cards.
-- Bucket `venue-images` (public) is auto-created on first upload.
+- Bucket `bublnetorg` (public) is auto-created on first upload. Override with `SUPABASE_STORAGE_BUCKET`.
 - Only tiny public CDN URLs travel in the listing payload (never bytes after the upload step).
 - **Unit tests**: `npm test` (in clientbackend) — see `test/image-processor.test.js`. Tests explicitly cover compression + "upload success" (mocked) for simulated large inputs, correct HD dimensions, and size reduction while preserving visibility.
 
 See root README and main backend/ for full production notes.
+
+## Automatic Supabase tables
+
+Set `SUPABASE_DB_URL` to the PostgreSQL connection string shown under Supabase
+Dashboard -> Connect. On startup, the client backend runs the idempotent
+`supabase-schema.sql` migration before serving requests. It creates `venues`,
+`profiles`, and `payments`, enables RLS, and grants server access to
+`service_role`. You can also run it explicitly with `npm run db:migrate`.

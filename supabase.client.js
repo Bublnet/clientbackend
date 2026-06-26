@@ -6,15 +6,30 @@ dotenv.config();
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !supabaseServiceKey) {
+function isServerKey(value) {
+  if (!value) return false;
+  if (value.startsWith('sb_secret_')) return true;
+  if (!value.startsWith('eyJ')) return false;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(value.split('.')[1], 'base64url').toString('utf8'),
+    );
+    return payload.role === 'service_role';
+  } catch (_) {
+    return false;
+  }
+}
+
+const hasServerKey = isServerKey(supabaseServiceKey);
+
+if (!supabaseUrl || !hasServerKey) {
   console.warn(
-    '⚠️  Supabase credentials missing in env. /api/cdn/upload (image CDN) and other Supabase features will be disabled or fail.'
+    'Supabase server credentials are missing or publishable-only. Set SUPABASE_SERVICE_ROLE_KEY to an sb_secret_ key or legacy service_role JWT.',
   );
 }
 
-// Service role client (server only — full access, bypasses RLS).
-// Used here for secure direct uploads to the public 'venue-images' bucket from the clientbackend proxy.
-export const supabase = (supabaseUrl && supabaseServiceKey)
+// Server-only client. Never expose this credential to Flutter or browser code.
+export const supabase = (supabaseUrl && hasServerKey)
   ? createClient(supabaseUrl, supabaseServiceKey, {
       auth: {
         autoRefreshToken: false,
@@ -23,9 +38,8 @@ export const supabase = (supabaseUrl && supabaseServiceKey)
     })
   : null;
 
-// Helper to check if Supabase is configured (for CDN + future use)
 export function isSupabaseConfigured() {
-  return !!(supabaseUrl && supabaseServiceKey);
+  return !!(supabaseUrl && hasServerKey);
 }
 
 export default supabase;

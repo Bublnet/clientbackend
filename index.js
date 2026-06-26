@@ -15,6 +15,7 @@ import { db, auth, hasFirebaseServerCredentials, initFirebaseAdmin } from './fir
 import supabase, { isSupabaseConfigured } from './supabase.client.js';
 import sharp from 'sharp';
 import { processAndUploadToCdn, MOCK_CDN } from './image-processor.js';
+import { ensureSupabaseSchema } from './supabase-migrate.js';
 
 dotenv.config();
 
@@ -26,6 +27,8 @@ const PORT = process.env.PORT || 4002;
 const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'http://localhost:4001';
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
+const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
+const ADMIN_TOKEN_PATTERN = /^asdf_[A-Za-z0-9_-]{43}$/;
 
 const AUTH_OTP_TTL_MS = Number(process.env.AUTH_OTP_TTL_MS || 10 * 60 * 1000);
 const authBaseUrl = `https://identitytoolkit.googleapis.com/v1/accounts`;
@@ -37,7 +40,7 @@ initFirebaseAdmin();
 
 if (isSupabaseConfigured()) {
   console.log('[clientbackend] Supabase CDN configured for image uploads.');
-  console.log('[clientbackend] NOTE: You must create the PUBLIC "venue-images" bucket once in your Supabase Dashboard (Storage).');
+  console.log(`[clientbackend] Storage bucket: ${process.env.SUPABASE_STORAGE_BUCKET || 'bublnetorg'}.`);
   console.log('[clientbackend] The server will now give a clear error + instructions on first upload if the bucket is missing.');
 } else {
   console.warn('[clientbackend] Supabase CDN NOT configured. Set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY for /api/cdn/upload to work.');
@@ -57,6 +60,68 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 
 app.set('trust proxy', 1);
+
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
+async function updateStaticPincodeCache() {
+  try {
+    const { data: approved, error } = await supabase
+      .from('venues')
+      .select('*')
+      .eq('status', 'approved');
+
+    if (error) throw error;
+
+    const byPincode = {};
+    for (const v of approved) {
+      if (!v.pincode) continue;
+      const prefix = String(v.pincode).substring(0, 3);
+      if (!byPincode[prefix]) byPincode[prefix] = [];
+      byPincode[prefix].push(toListing(v));
+    }
+
+    const publicDir = path.join(__dirname, 'public', 'pincodes');
+    if (!fs.existsSync(publicDir)) {
+      fs.mkdirSync(publicDir, { recursive: true });
+    }
+
+    const desiredFiles = new Set(
+      Object.keys(byPincode).map((prefix) => `${prefix}.json`),
+    );
+    let changedFiles = 0;
+
+    // Remove only cache entries that no longer have approved listings.
+    const files = fs.readdirSync(publicDir);
+    for (const file of files) {
+      if (file.endsWith('.json') && !desiredFiles.has(file)) {
+        fs.unlinkSync(path.join(publicDir, file));
+        changedFiles += 1;
+      }
+    }
+
+    for (const [prefix, list] of Object.entries(byPincode)) {
+      const target = path.join(publicDir, `${prefix}.json`);
+      const content = JSON.stringify({ ok: true, venues: list });
+      const current = fs.existsSync(target)
+        ? fs.readFileSync(target, 'utf8')
+        : null;
+      if (current === content) continue;
+
+      // Replace atomically so readers never observe a partially written file.
+      const temporary = `${target}.tmp`;
+      fs.writeFileSync(temporary, content);
+      fs.renameSync(temporary, target);
+      changedFiles += 1;
+    }
+    console.log(
+      changedFiles > 0
+        ? `[clientbackend] Updated static pincode cache for ${Object.keys(byPincode).length} prefixes (${changedFiles} files changed).`
+        : `[clientbackend] Static pincode cache is current for ${Object.keys(byPincode).length} prefixes.`,
+    );
+  } catch (err) {
+    console.error('[clientbackend] Failed to update static pincode cache:', err);
+  }
+}
 
 // CORS must be early so preflight OPTIONS for cross-origin POSTs (e.g. /api/cdn/upload from Flutter web on :8080)
 // get proper Access-Control-Allow-Origin, methods, and headers (including Authorization).
@@ -86,6 +151,32 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 // Raised limit to support base64 image data for single-image CDN uploads (picker compresses to ~1280px@72%).
 // Each /cdn/upload is one image at a time. Final /venues payload is small (only URLs).
 app.use(express.json({ limit: '15mb' }));
+
+// Global Data Logging Middleware
+const schemaReady = ensureSupabaseSchema();
+const dataReady = schemaReady.then(async (result) => {
+  if (isSupabaseConfigured()) {
+    try {
+      await backfillListingOwnerEmails();
+    } catch (error) {
+      console.warn('[clientbackend] Owner-email backfill skipped:', error.message);
+    }
+  }
+  await updateStaticPincodeCache();
+  return result;
+});
+app.use(async (_req, res, next) => {
+  try {
+    await dataReady;
+    next();
+  } catch (error) {
+    console.error('[clientbackend] Supabase schema is unavailable:', error.message);
+    res.status(503).json({
+      ok: false,
+      message: 'Supabase database initialization failed. Check SUPABASE_DB_URL and server logs.',
+    });
+  }
+});
 
 // Rate limiters (client surface - slightly stricter defaults)
 const authLimiter = rateLimit({
@@ -128,37 +219,26 @@ function clampInt(value, fallback, min, max) {
 }
 
 async function firebasePasswordRequest(action, payload) {
-  if (!FIREBASE_API_KEY) {
-    const error = new Error('Firebase API key is not configured.');
-    error.status = 500;
-    throw error;
+  if (action === 'signInWithPassword') {
+    const { data, error } = await supabase.auth.signInWithPassword({ email: payload.email, password: payload.password });
+    if (error) throw { status: 400, message: error.message };
+    return { idToken: data.session.access_token, localId: data.user.id, email: data.user.email };
   }
-  const response = await fetch(`${authBaseUrl}:${action}?key=${FIREBASE_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    const error = new Error(mapFirebaseAuthError(data?.error?.message));
-    error.status = 400;
-    throw error;
+  if (action === 'signUp') {
+    const { data, error } = await supabase.auth.signUp({ email: payload.email, password: payload.password });
+    if (error) throw { status: 400, message: error.message };
+    return { idToken: data.session?.access_token || '', localId: data.user.id, email: data.user.email };
   }
-  return data;
+  if (action === 'sendOobCode') {
+    const { error } = await supabase.auth.resetPasswordForEmail(payload.email);
+    if (error) throw { status: 400, message: error.message };
+    return {};
+  }
+  throw new Error(`Unsupported auth action: ${action}`);
 }
 
 function mapFirebaseAuthError(code) {
-  switch (code) {
-    case 'EMAIL_EXISTS': return 'An account already exists for this email.';
-    case 'EMAIL_NOT_FOUND':
-    case 'INVALID_PASSWORD':
-    case 'INVALID_LOGIN_CREDENTIALS':
-      return 'Invalid login credentials.';
-    case 'WEAK_PASSWORD : Password should be at least 6 characters':
-    case 'WEAK_PASSWORD':
-      return 'Password must be at least 6 characters.';
-    default: return 'Authentication failed.';
-  }
+  return code;
 }
 
 async function handleError(res, error) {
@@ -173,10 +253,16 @@ async function handleError(res, error) {
 }
 
 async function getUserProfile(uid) {
-  const ref = db.collection('users').doc(uid);
-  const snap = await ref.get();
-  if (snap.exists) return { id: uid, ...snap.data() };
-  return { id: uid };
+  const { data, error } = await supabase.from('profiles').select('*').eq('id', uid).maybeSingle();
+  if (error) throw error;
+  if (!data) return { id: uid };
+  return {
+    ...data,
+    id: uid,
+    name: data.display_name,
+    identifier: data.email,
+    parentId: data.parent_id,
+  };
 }
 
 async function ensureUserProfile(uid, fallback = {}) {
@@ -202,10 +288,73 @@ function publicUser(profile) {
     id: profile.id,
     name: profile.name || 'Dvenue User',
     identifier: profile.identifier || profile.email || '',
+    email: profile.email || profile.identifier || '',
     role: profile.role || 'client',
+    parentId: profile.parentId || profile.parent_id || null,
+    permissions: profile.permissions || {},
     isPremium: profile.isPremium === true || profile.is_premium === true,
     adAccessUntil: profile.adAccessUntil || profile.ad_access_until || null,
   };
+}
+
+async function backfillListingOwnerEmails() {
+  const { data: listings, error } = await supabase
+    .from('venues')
+    .select('id,ownerId,ownerEmail')
+    .is('ownerEmail', null)
+    .limit(500);
+  if (error) throw error;
+
+  const emailByOwner = new Map();
+  for (const listing of listings || []) {
+    if (!listing.ownerId) continue;
+    if (!emailByOwner.has(listing.ownerId)) {
+      const profile = await getUserProfile(listing.ownerId);
+      emailByOwner.set(
+        listing.ownerId,
+        normalizeIdentifier(profile.email || profile.identifier),
+      );
+    }
+    const ownerEmail = emailByOwner.get(listing.ownerId);
+    if (!ownerEmail) continue;
+    const { error: updateError } = await supabase
+      .from('venues')
+      .update({ ownerEmail })
+      .eq('id', listing.id)
+      .eq('ownerId', listing.ownerId);
+    if (updateError) throw updateError;
+  }
+}
+
+async function authenticateEnvAdminToken(token, req) {
+  if (!ADMIN_TOKEN_PATTERN.test(String(token || ''))) return false;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const ref = db.collection('adminSessions').doc(tokenHash);
+  const snap = await ref.get();
+  if (!snap.exists) return false;
+  const session = snap.data();
+  if (session.subject !== 'env-admin' || session.role !== 'admin' || Number(session.expiresAt) <= Date.now()) {
+    await ref.delete().catch(() => {});
+    return false;
+  }
+  const email = normalizeIdentifier(ADMIN_LOGIN_IDENTIFIER);
+  const profile = {
+    id: 'env-admin',
+    name: process.env.ADMIN_DISPLAY_NAME || 'Dvenue Administrator',
+    identifier: email,
+    email,
+    role: 'admin',
+    isPremium: true,
+  };
+  req.auth = {
+    source: 'env-admin',
+    token,
+    decoded: { uid: 'env-admin' },
+    user: publicUser(profile),
+    profile,
+    sessionTokenHash: tokenHash,
+  };
+  return true;
 }
 
 async function requireAuth(req, res, next) {
@@ -219,15 +368,29 @@ async function requireAuth(req, res, next) {
     }
     const idToken = match[1];
 
-    // Verify with Firebase Admin (works for both dev/prod)
-    const decoded = await auth.verifyIdToken(idToken, true); // checkRevoked for safety
+    if (await authenticateEnvAdminToken(idToken, req)) {
+      return next();
+    }
 
-    // If token is expired or revoked, verifyIdToken throws
-    const profile = await ensureUserProfile(decoded.uid, {
-      email: decoded.email,
-      identifier: decoded.email,
-      name: decoded.name || decoded.email?.split('@')[0] || 'User',
-    });
+    const { data: authData, error: authError } = await supabase.auth.getUser(idToken);
+    if (authError || !authData?.user) {
+      const authFailure = new Error('Session expired. Please login again.');
+      authFailure.status = 401;
+      throw authFailure;
+    }
+    const authUser = authData.user;
+    const profile = await getUserProfile(authUser.id);
+    
+    const storedRole = profile.role;
+    const metaRole = authUser.user_metadata?.role;
+    profile.role = (storedRole && storedRole !== 'client') ? storedRole : (metaRole || storedRole || 'client');
+
+    if (profile.active === false) {
+      const disabled = new Error('This account has been disabled.');
+      disabled.status = 403;
+      throw disabled;
+    }
+    const decoded = { uid: authUser.id, sub: authUser.id, email: authUser.email };
 
     req.auth = {
       token: idToken,
@@ -242,6 +405,24 @@ async function requireAuth(req, res, next) {
   }
 }
 
+function requireRole(roles) {
+  return (req, res, next) => {
+    if (!req.auth || !roles.includes(req.auth.user.role)) {
+      return res.status(403).json({ ok: false, message: 'You do not have access to this action.' });
+    }
+    return next();
+  };
+}
+
+const requireStaff = requireRole(['admin', 'staff']);
+const requireHost = requireRole(['host']);
+
+function ownerScopeId(authContext) {
+  return authContext?.user?.role === 'hoststaff'
+    ? authContext.user.parentId
+    : authContext?.user?.id;
+}
+
 // Premium or ad soft-access gate (client reads)
 function requirePremiumOrAd(req, res, next) {
   const profile = req.auth.profile || {};
@@ -253,7 +434,7 @@ function requirePremiumOrAd(req, res, next) {
     if (d instanceof Date && !Number.isNaN(d.getTime())) adAccessUntil = d;
   }
   const role = req.auth.user.role;
-  const hasAccess = isPremium || ['admin', 'manager', 'support', 'reviewer'].includes(role) || (adAccessUntil && adAccessUntil.getTime() > Date.now());
+  const hasAccess = isPremium || ['admin', 'staff', 'host', 'hoststaff'].includes(role) || (adAccessUntil && adAccessUntil.getTime() > Date.now());
 
   if (!hasAccess) {
     return res.status(402).json({
@@ -263,6 +444,42 @@ function requirePremiumOrAd(req, res, next) {
     });
   }
   next();
+}
+
+function hasVenueDetailsAccess(req) {
+  const profile = req.auth?.profile || {};
+  const isPremium = profile.isPremium === true || profile.is_premium === true;
+  const adRaw = profile.adAccessUntil || profile.ad_access_until;
+  const adUntil = adRaw
+    ? (typeof adRaw === 'string' ? new Date(adRaw) : (adRaw?.toDate ? adRaw.toDate() : new Date(adRaw)))
+    : null;
+  return isPremium
+    || ['admin', 'staff', 'host', 'hoststaff'].includes(req.auth?.user?.role)
+    || (adUntil instanceof Date && !Number.isNaN(adUntil.getTime()) && adUntil.getTime() > Date.now());
+}
+
+function venueForViewer(listing, req) {
+  if (hasVenueDetailsAccess(req)) return { ...listing, detailsLocked: false };
+  return {
+    ...listing,
+    detailsLocked: true,
+    basePrice: null,
+    gstAmount: null,
+    priceWithGst: null,
+    priceRange: '',
+    spaces: Array.isArray(listing.spaces)
+      ? listing.spaces.map((space) => {
+        const {
+          dayPrice: _dayPrice,
+          nightPrice: _nightPrice,
+          hourlyPrices: _hourlyPrices,
+          price: _price,
+          ...safeSpace
+        } = space || {};
+        return safeSpace;
+      })
+      : [],
+  };
 }
 
 function assertFirebaseServerConfigured() {
@@ -339,6 +556,18 @@ function sanitizeSpecTable(raw) {
 }
 
 // --- Client-safe routes only (no admin/staff privileged set operations) ---
+app.use([
+  '/api/auth/login',
+  '/api/auth/signup',
+  '/api/auth/signup/start',
+  '/api/auth/signup/complete',
+  '/api/auth/password-reset/start',
+  '/api/auth/password-reset/verify',
+  '/api/auth/password-reset/complete',
+], (_req, res) => res.status(410).json({
+  ok: false,
+  message: 'Authenticate directly with Supabase Auth from the Flutter application.',
+}));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'dvenue-clientbackend', port: PORT });
@@ -455,6 +684,17 @@ app.post('/api/auth/validate', authLimiter, async (req, res) => {
     if (!token) {
       return res.status(400).json({ ok: false, message: 'Token required.' });
     }
+    if (ADMIN_TOKEN_PATTERN.test(token)) {
+      const mockReq = { headers: req.headers };
+      if (!await authenticateEnvAdminToken(token, mockReq)) {
+        return res.status(401).json({ ok: false, message: 'Admin session expired or invalid.' });
+      }
+      return res.json({
+        ok: true,
+        message: 'Session valid.',
+        data: { token, user: mockReq.auth.user, expiresAt: null },
+      });
+    }
     // This will throw if expired/revoked/invalid
     const decoded = await auth.verifyIdToken(token, true);
     const profile = await getUserProfile(decoded.uid);
@@ -493,6 +733,9 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 });
 
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
+  if (req.auth.source === 'env-admin' && req.auth.sessionTokenHash) {
+    await db.collection('adminSessions').doc(req.auth.sessionTokenHash).delete();
+  }
   res.json({ ok: true, message: 'Logged out.' });
 });
 
@@ -502,7 +745,7 @@ app.post('/api/auth/logout', requireAuth, async (req, res) => {
 // for public queries + bookings on BOTH surfaces) live only on main backend/. ---
 
 // Explore / search (gated by premium/ad for full access)
-app.get('/api/venues/explore', requireAuth, requirePremiumOrAd, async (req, res) => {
+app.get('/api/venues/explore', requireAuth, async (req, res) => {
   try {
     const { data: venues, error } = await supabase
       .from('venues')
@@ -510,14 +753,14 @@ app.get('/api/venues/explore', requireAuth, requirePremiumOrAd, async (req, res)
       .eq('status', 'approved');
       
     if (error) throw error;
-    const formattedVenues = venues.map(toListing);
+    const formattedVenues = venues.map(toListing).map((listing) => venueForViewer(listing, req));
     res.json({ ok: true, message: 'Venues loaded.', venues: formattedVenues, nearby: formattedVenues, all: formattedVenues });
   } catch (error) {
     return handleError(res, error);
   }
 });
 
-app.get('/api/venues/search', requireAuth, requirePremiumOrAd, async (req, res) => {
+app.get('/api/venues/search', requireAuth, async (req, res) => {
   try {
     const { data: results, error } = await supabase
       .from('venues')
@@ -525,13 +768,17 @@ app.get('/api/venues/search', requireAuth, requirePremiumOrAd, async (req, res) 
       .eq('status', 'approved');
       
     if (error) throw error;
-    res.json({ ok: true, message: 'Search complete.', results: results.map(toListing) });
+    res.json({
+      ok: true,
+      message: 'Search complete.',
+      results: results.map(toListing).map((listing) => venueForViewer(listing, req)),
+    });
   } catch (error) {
     return handleError(res, error);
   }
 });
 
-app.get('/api/venues/:id', requireAuth, requirePremiumOrAd, async (req, res) => {
+app.get('/api/venues/:id([0-9a-fA-F-]{36})', requireAuth, async (req, res) => {
   try {
     const { data: listing, error } = await supabase
       .from('venues')
@@ -546,7 +793,7 @@ app.get('/api/venues/:id', requireAuth, requirePremiumOrAd, async (req, res) => 
     
     const formattedListing = toListing(listing);
     if (formattedListing.status !== 'approved') return res.status(404).json({ ok: false, message: 'Listing not found.' });
-    return res.json({ ok: true, listing: formattedListing });
+    return res.json({ ok: true, listing: venueForViewer(formattedListing, req) });
   } catch (error) {
     return handleError(res, error);
   }
@@ -555,20 +802,37 @@ app.get('/api/venues/:id', requireAuth, requirePremiumOrAd, async (req, res) => 
 // Owner's own listings (client can see their submissions)
 app.get('/api/venues/mine', requireAuth, async (req, res) => {
   try {
+    // Allow all roles including clients to see their own submitted listings
+    const ownerId = ownerScopeId(req.auth);
+    const ownerEmail = normalizeIdentifier(req.auth.profile.email || req.auth.user.identifier);
     const { data: listings, error } = await supabase
       .from('venues')
       .select('*')
-      .eq('ownerId', req.auth.user.id);
+      .eq('ownerId', ownerId);
       
     if (error) throw error;
-    res.json({ ok: true, message: 'Listings loaded.', listings: listings.map(toListing) });
+    if (req.auth.user.role === 'host' && ownerEmail && listings.some((listing) => !listing.ownerEmail)) {
+      await supabase
+        .from('venues')
+        .update({ ownerEmail, updatedAt: nowIso() })
+        .eq('ownerId', ownerId)
+        .is('ownerEmail', null);
+    }
+    res.json({
+      ok: true,
+      message: 'Listings loaded.',
+      listings: listings.map((listing) => toListing({
+        ...listing,
+        ownerEmail: listing.ownerEmail || ownerEmail,
+      })),
+    });
   } catch (error) {
     return handleError(res, error);
   }
 });
 
 // Admin pending (fetched by main admin backend for verification flow)
-app.get('/api/venues/admin/pending', requireAuth, async (req, res) => {
+app.get('/api/venues/admin/pending', requireAuth, requireStaff, async (req, res) => {
   try {
     const { data: listings, error } = await supabase
       .from('venues')
@@ -577,6 +841,85 @@ app.get('/api/venues/admin/pending', requireAuth, async (req, res) => {
       
     if (error) throw error;
     res.json({ ok: true, message: 'Pending listings loaded.', listings: listings.map(toListing) });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.get('/api/venues/admin/all', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const { data: listings, error } = await supabase
+      .from('venues')
+      .select('*')
+      .order('updatedAt', { ascending: false });
+    if (error) throw error;
+    res.json({ ok: true, message: 'All listings loaded.', listings: listings.map(toListing) });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.patch('/api/venues/admin/:id/verification', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const status = String(req.body.status || '');
+    if (!['contacted', 'details_verified'].includes(status)) {
+      return res.status(400).json({ ok: false, message: 'Invalid verification status.' });
+    }
+    const update = {
+      verificationStatus: status,
+      verificationNotes: req.body.notes || null,
+      updatedAt: nowIso(),
+      ...(status === 'contacted' ? { contactedAt: nowIso() } : {}),
+    };
+    const { data: listing, error } = await supabase
+      .from('venues')
+      .update(update)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ ok: true, message: 'Verification stage updated.', listing: toListing(listing) });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.patch('/api/venues/admin/:id/review', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const approve = req.body.approve === true;
+    const update = approve
+      ? {
+          status: 'approved',
+          verified: true,
+          verificationStatus: 'approved',
+          approvedAt: nowIso(),
+          rejectionReason: null,
+          updatedAt: nowIso(),
+        }
+      : {
+          status: 'rejected',
+          verified: false,
+          verificationStatus: 'rejected',
+          rejectionReason: req.body.reason || 'Rejected',
+          updatedAt: nowIso(),
+        };
+    const { data: listing, error } = await supabase
+      .from('venues')
+      .update(update)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) throw error;
+
+    if (approve) {
+      await updateStaticPincodeCache();
+    }
+
+    res.json({
+      ok: true,
+      message: approve ? 'Listing approved.' : 'Listing rejected.',
+      listing: toListing(listing),
+    });
   } catch (error) {
     return handleError(res, error);
   }
@@ -602,6 +945,7 @@ app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
     const payload = cleanForFirestore({
       ...clientPayload,
       ownerId: req.auth.user.id,
+      ownerEmail: normalizeIdentifier(req.auth.profile.email || req.auth.user.identifier),
       ownerName: req.auth.user.name,
       status: 'pending',
       submittedAt: clientPayload.submittedAt || nowIso(),
@@ -638,9 +982,82 @@ app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
   }
 });
 
+app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
+  try {
+    const { data: existing, error: readError } = await supabase
+      .from('venues')
+      .select('id,ownerId,ownerEmail,status,verified,"verificationStatus"')
+      .eq('id', req.params.id)
+      .single();
+    if (readError || !existing) {
+      return res.status(404).json({ ok: false, message: 'Listing not found.' });
+    }
+    if (existing.ownerId !== ownerScopeId(req.auth)) {
+      return res.status(403).json({ ok: false, message: 'You do not own this listing.' });
+    }
+
+    const clientPayload = req.body || {};
+    const isCalendarOnly = clientPayload.calendarOnly === true;
+    if (req.auth.user.role === 'hoststaff' && !isCalendarOnly) {
+      return res.status(403).json({
+        ok: false,
+        message: 'Host staff may update prices and availability only.',
+      });
+    }
+    const update = cleanForFirestore({
+      ...clientPayload,
+      id: undefined,
+      ownerId: undefined,
+      ownerEmail: undefined,
+      ownerName: undefined,
+      status: isCalendarOnly ? existing.status : 'pending',
+      verified: isCalendarOnly ? existing.verified : false,
+      verificationStatus: isCalendarOnly ? existing.verificationStatus : 'pending_contact',
+      calendarOnly: undefined,
+      updatedAt: nowIso(),
+      images: Array.isArray(clientPayload.images)
+        ? clientPayload.images.filter((value) => typeof value === 'string' && value.startsWith('http'))
+        : [],
+      thumbnails: Array.isArray(clientPayload.thumbnails)
+        ? clientPayload.thumbnails.filter((value) => typeof value === 'string' && value.startsWith('http'))
+        : [],
+      specTable: sanitizeSpecTable(clientPayload.specTable),
+    });
+    const { data: listing, error } = await supabase
+      .from('venues')
+      .update(update)
+      .eq('id', req.params.id)
+      .eq('ownerId', ownerScopeId(req.auth))
+      .select()
+      .single();
+    if (error) throw error;
+    res.json({ ok: true, message: 'Listing updated and returned to review.', listing: toListing(listing) });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
+app.delete('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
+  try {
+    const { data: deleted, error } = await supabase
+      .from('venues')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('ownerId', req.auth.user.id)
+      .select('id');
+    if (error) throw error;
+    if (!deleted || deleted.length === 0) {
+      return res.status(404).json({ ok: false, message: 'Listing not found or not owned by you.' });
+    }
+    res.json({ ok: true, message: 'Listing removed.' });
+  } catch (error) {
+    return handleError(res, error);
+  }
+});
+
 // CDN image upload proxy (client submits temp data: URLs here; backend uploads real compressed HD+thumb to Supabase)
 // Returns public CDN URLs only. Uses service role (never exposed to Flutter).
-// The 'venue-images' public bucket is verified on every upload. If missing, a clear actionable error
+// The configured public bucket is verified on every upload. If missing, a clear actionable error
 // is returned telling the user exactly how to create it in the Supabase dashboard (one-time setup).
 app.post('/api/cdn/upload', requireAuth, writeLimiter, async (req, res) => {
   try {
@@ -757,12 +1174,11 @@ app.post('/api/access/grant-ad', requireAuth, writeLimiter, async (req, res) => 
   try {
     const TTL_MS = Number(process.env.AD_ACCESS_TTL_MS || 45 * 60 * 1000);
     const until = new Date(Date.now() + TTL_MS);
-    const ref = db.collection('users').doc(req.auth.user.id);
-    await ref.set({
-      adAccessUntil: until.toISOString(),
-      adAccessGrantedAt: nowIso(),
-      updatedAt: nowIso(),
-    }, { merge: true });
+    const { error } = await supabase.from('profiles').update({
+      ad_access_until: until.toISOString(),
+      updated_at: nowIso(),
+    }).eq('id', req.auth.user.id);
+    if (error) throw error;
     res.json({ ok: true, message: 'Ad access granted.', data: { adAccessUntil: until.toISOString() } });
   } catch (error) {
     return handleError(res, error);
@@ -771,11 +1187,12 @@ app.post('/api/access/grant-ad', requireAuth, writeLimiter, async (req, res) => 
 
 app.post('/api/access/activate-premium', requireAuth, async (req, res) => {
   try {
-    await db.collection('users').doc(req.auth.user.id).set({
-      isPremium: true,
-      premiumSince: nowIso(),
-      updatedAt: nowIso(),
-    }, { merge: true });
+    const { error } = await supabase.from('profiles').update({
+      is_premium: true,
+      premium_since: nowIso(),
+      updated_at: nowIso(),
+    }).eq('id', req.auth.user.id);
+    if (error) throw error;
     res.json({ ok: true, message: 'Premium activated.', data: { isPremium: true } });
   } catch (error) {
     return handleError(res, error);
@@ -792,11 +1209,10 @@ app.get('/api/profiles/me', requireAuth, async (req, res) => {
 app.patch('/api/profiles/me/location', requireAuth, async (req, res) => {
   try {
     const loc = req.body && (req.body.manual_location || req.body.manualLocation || null);
-    await db.collection('users').doc(req.auth.user.id).set({
-      manualLocation: loc,
-      manual_location: loc,
-      updatedAt: nowIso(),
-    }, { merge: true });
+    const { error } = await supabase.from('profiles')
+      .update({ manual_location: loc, updated_at: nowIso() })
+      .eq('id', req.auth.user.id);
+    if (error) throw error;
     res.json({ ok: true, message: 'Location saved.' });
   } catch (error) {
     return handleError(res, error);

@@ -113,7 +113,7 @@ describe('image-processor (CDN compression + upload)', () => {
     assert.strictEqual(uploads.length, 2, 'exactly two uploads (hd + thumb) should have been attempted');
     assert.ok(uploads[0].path.includes('-hd.'), 'first upload should be the HD version');
     assert.ok(uploads[1].path.includes('-thumb.'), 'second upload should be the thumb version');
-    assert.ok(uploads.every(u => u.bucket === 'venue-images'), 'must target the correct bucket');
+    assert.ok(uploads.every(u => u.bucket === 'bublnetorg'), 'must target the correct bucket');
   });
 
   test('processAndUploadToCdn rejects invalid dataUrl early', async () => {

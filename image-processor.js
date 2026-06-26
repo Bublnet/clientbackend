@@ -14,7 +14,7 @@ import supabaseDefault from './supabase.client.js';
  * - Final transfer: only tiny public URLs are sent in listing payload (not images).
  */
 
-const DEFAULT_BUCKET = 'venue-images';
+export const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'bublnetorg';
 
 // Toggle this to false when you have a real Supabase bucket configured.
 export const MOCK_CDN = false;
@@ -92,7 +92,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     };
   }
 
-  const bucket = DEFAULT_BUCKET;
+  const bucket = STORAGE_BUCKET;
 
   // Best-effort auto-create (service role). Many projects hit RLS quirks on createBucket,
   // so we treat it as optional and do a hard existence check afterwards.
@@ -127,7 +127,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
       `FIX (one-time):\n` +
       `1. Open your Supabase Dashboard\n` +
       `2. Go to Storage → "New bucket"\n` +
-      `3. Name: venue-images\n` +
+      `3. Name: ${bucket}\n` +
       `4. Toggle "Public bucket" ON\n` +
       `5. Create\n\n` +
       `Then restart the clientbackend (4002). Image uploads will then work.`
@@ -163,7 +163,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     if (lower.includes('not found') || lower.includes('bucket')) {
       throw new Error(
         `HD upload failed because bucket '${bucket}' is missing. ` +
-        `Please create the public bucket 'venue-images' in your Supabase Dashboard (Storage).`
+        `Please create the public bucket '${bucket}' in your Supabase Dashboard (Storage).`
       );
     }
     throw new Error(`HD upload failed: ${detail}`);
@@ -182,7 +182,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     if (lower.includes('not found') || lower.includes('bucket')) {
       throw new Error(
         `Thumb upload failed because bucket '${bucket}' is missing. ` +
-        `Please create the public bucket 'venue-images' in your Supabase Dashboard (Storage).`
+        `Please create the public bucket '${bucket}' in your Supabase Dashboard (Storage).`
       );
     }
     throw new Error(`Thumb upload failed: ${detail}`);

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "npx nodemon index.js",
+    "db:migrate": "node supabase-migrate.js",
     "test": "node --test test/*.test.js",
     "test:watch": "node --test --watch test/*.test.js"
   },
@@ -19,6 +20,7 @@
     "firebase-admin": "^12.1.0",
     "helmet": "^7.1.0",
     "node-fetch": "^3.3.2",
+    "pg": "^8.16.3",
     "sharp": "^0.33.4"
   },
   "engines": {

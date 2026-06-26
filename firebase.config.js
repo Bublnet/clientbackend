@@ -1,56 +1,145 @@
 import fs from 'fs';
 import path from 'path';
-import { applicationDefault, cert, getApps, initializeApp } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
-import { getFirestore } from 'firebase-admin/firestore';
-import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import supabase from './supabase.client.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+export const hasFirebaseServerCredentials = true;
 
-const localServiceAccountPath = path.join(__dirname, '..', 'backend', 'inventory-management-ce97e-firebase-adminsdk-r6egv-3376080a19.json');
-const hasLocalServiceAccount = fs.existsSync(localServiceAccountPath);
+export function initFirebaseAdmin() { return true; }
 
-export function initFirebaseAdmin() {
-  if (getApps().length) return getApps()[0];
-
-  let credential;
-  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
-
-  if (rawJson || base64Json) {
-    const parsed = JSON.parse(
-      rawJson || Buffer.from(base64Json, 'base64').toString('utf8'),
-    );
-    credential = cert(parsed);
-  } else if (hasLocalServiceAccount) {
-    const parsed = JSON.parse(fs.readFileSync(localServiceAccountPath, 'utf8'));
-    credential = cert(parsed);
-  } else {
-    credential = applicationDefault();
+class FirestoreBatch {
+  constructor(client) { this.client = client; this.ops = []; }
+  set(ref, data, opts) { this.ops.push({ type: 'set', ref, data, opts }); }
+  async commit() {
+    for (const op of this.ops) {
+      if (op.type === 'set') {
+        await op.ref.set(op.data, op.opts);
+      }
+    }
   }
-
-  const appConfig = {
-    credential,
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  };
-  if (!rawJson && !base64Json && !hasLocalServiceAccount && process.env.FIREBASE_PROJECT_ID) {
-    appConfig.projectId = process.env.FIREBASE_PROJECT_ID;
-  }
-
-  const app = initializeApp(appConfig);
-  return app;
 }
 
-initFirebaseAdmin();
+class FirestoreDoc {
+  constructor(table, id, supabaseClient) {
+    this.table = table;
+    this.id = id;
+    this.supabaseClient = supabaseClient;
+  }
+  collection(subTable) {
+    if (this.table === 'venues' && subTable === 'priceHistory') return new FirestoreCollection('venue_price_history', this.supabaseClient);
+    return new FirestoreCollection(`${this.table}_${subTable}`, this.supabaseClient);
+  }
+  async get() {
+    const { data, error } = await this.supabaseClient.from(this.table).select('*').eq('id', this.id).maybeSingle();
+    if (error) {
+      console.error(`Mock Firestore error getting ${this.table}/${this.id}:`, error);
+      throw error;
+    }
+    return {
+      exists: !!data,
+      id: this.id,
+      data: () => data || {}
+    };
+  }
+  async set(data, options = {}) {
+    const cleanData = Object.fromEntries(Object.entries(data).filter(([_, v]) => v !== undefined));
+    const { error } = await this.supabaseClient.from(this.table).upsert({ id: this.id, ...cleanData });
+    if (error) {
+      console.error(`Mock Firestore error setting ${this.table}/${this.id}:`, error);
+      throw error;
+    }
+  }
+  async delete() {
+    const { error } = await this.supabaseClient.from(this.table).delete().eq('id', this.id);
+    if (error) throw error;
+  }
+}
 
-export const db = getFirestore();
-export const auth = getAuth();
+class FirestoreQuery {
+  constructor(table, supabaseClient) {
+    this.table = table;
+    this.supabaseClient = supabaseClient;
+    this._where = [];
+    this._orderBy = [];
+    this._limit = null;
+  }
+  where(field, op, value) {
+    this._where.push({ field, op, value });
+    return this;
+  }
+  limit(n) {
+    this._limit = n;
+    return this;
+  }
+  orderBy(field, dir = 'asc') {
+    this._orderBy.push({ field, dir });
+    return this;
+  }
+  async get() {
+    let q = this.supabaseClient.from(this.table).select('*');
+    for (const w of this._where) {
+      if (w.op === '==') q = q.eq(w.field, w.value);
+      else if (w.op === '>=') q = q.gte(w.field, w.value);
+      else if (w.op === '<=') q = q.lte(w.field, w.value);
+      else if (w.op === '<') q = q.lt(w.field, w.value);
+      else if (w.op === '>') q = q.gt(w.field, w.value);
+      else if (w.op === 'in') q = q.in(w.field, w.value);
+      else if (w.op === 'array-contains') q = q.contains(w.field, [w.value]);
+    }
+    for (const o of this._orderBy) {
+      q = q.order(o.field, { ascending: o.dir === 'asc' });
+    }
+    if (this._limit !== null) q = q.limit(this._limit);
+    const { data, error } = await q;
+    if (error) {
+      console.error(`Mock Firestore query error on ${this.table}:`, error);
+      throw error;
+    }
+    return {
+      empty: data.length === 0,
+      docs: data.map(d => ({
+        id: d.id,
+        exists: true,
+        data: () => d
+      }))
+    };
+  }
+}
 
-export const hasFirebaseServerCredentials = Boolean(
-  process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    || process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
-    || process.env.GOOGLE_APPLICATION_CREDENTIALS
-    || process.env.K_SERVICE
-    || hasLocalServiceAccount,
-);
+class FirestoreCollection extends FirestoreQuery {
+  doc(id) {
+    return new FirestoreDoc(this.table, id, this.supabaseClient);
+  }
+  async add(data) {
+    const cleanData = Object.fromEntries(Object.entries(data).filter(([_, v]) => v !== undefined));
+    if (!cleanData.id) {
+      cleanData.id = crypto.randomUUID();
+    }
+    const { data: res, error } = await this.supabaseClient.from(this.table).insert(cleanData).select().single();
+    if (error) throw error;
+    return new FirestoreDoc(this.table, res.id, this.supabaseClient);
+  }
+}
+
+class FirestoreMock {
+  constructor(supabaseClient) {
+    this.supabaseClient = supabaseClient;
+  }
+  collection(name) {
+    const tableMap = { 'users': 'profiles', 'adminSessions': 'admin_sessions', 'authOtps': 'auth_otps', 'venues': 'venues', 'bookings': 'bookings', 'settings': 'settings' };
+    return new FirestoreCollection(tableMap[name] || name, this.supabaseClient);
+  }
+  batch() {
+    return new FirestoreBatch(this.supabaseClient);
+  }
+}
+
+export const db = new FirestoreMock(supabase);
+
+export const auth = {
+  verifyIdToken: async (token) => {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user) throw new Error('Invalid token');
+    return { uid: data.user.id, email: data.user.email, exp: Math.floor(Date.now() / 1000) + 3600 };
+  }
+};
