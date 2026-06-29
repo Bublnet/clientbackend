@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { db, auth, hasFirebaseServerCredentials, initFirebaseAdmin } from './firebase.config.js';
 import supabase, { isSupabaseConfigured } from './supabase.client.js';
 import sharp from 'sharp';
-import { processAndUploadToCdn, MOCK_CDN } from './image-processor.js';
+import { processAndUploadToCdn, MOCK_CDN, STORAGE_100_BUCKET, LOGO_BUCKET, resizeTo100 } from './image-processor.js';
 import { ensureSupabaseSchema } from './supabase-migrate.js';
 
 dotenv.config();
@@ -957,6 +957,9 @@ app.post('/api/venues', requireAuth, writeLimiter, async (req, res) => {
       thumbnails: Array.isArray(clientPayload.thumbnails)
         ? clientPayload.thumbnails.filter((t) => typeof t === 'string' && t.startsWith('http'))
         : [],
+      coverImage: (typeof clientPayload.coverImage === 'string' && clientPayload.coverImage.startsWith('http'))
+        ? clientPayload.coverImage
+        : '',
       specTable: safeSpecTable,
       // Sanitize per-space specTable (flexible specs like pricing)
       spaces: Array.isArray(clientPayload.spaces)
@@ -1021,6 +1024,9 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
       thumbnails: Array.isArray(clientPayload.thumbnails)
         ? clientPayload.thumbnails.filter((value) => typeof value === 'string' && value.startsWith('http'))
         : [],
+      coverImage: (typeof clientPayload.coverImage === 'string' && clientPayload.coverImage.startsWith('http'))
+        ? clientPayload.coverImage
+        : '',
       specTable: sanitizeSpecTable(clientPayload.specTable),
     });
     const { data: listing, error } = await supabase
@@ -1067,7 +1073,7 @@ app.post('/api/cdn/upload', requireAuth, writeLimiter, async (req, res) => {
       throw error;
     }
 
-    const { dataUrl } = req.body || {};
+    const { dataUrl, size } = req.body || {};
     if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
       const error = new Error('Missing or invalid dataUrl. Must be a data: URL from the image picker.');
       error.status = 400;
@@ -1076,17 +1082,100 @@ app.post('/api/cdn/upload', requireAuth, writeLimiter, async (req, res) => {
 
     const ownerId = req.auth.user.id || 'anon';
 
-    // Delegate to processor: handles decode, early downsample for huge originals,
-    // HD (detailed yet compressed) + thumb, bucket existence check (with clear instructions if missing),
-    // and Supabase upload. Only tiny public CDN URLs are returned for the listing payload.
+    // Size-specific handling: 100px icons or logos
+    if (size === '100' || size === 'logo') {
+      const targetBucket = size === 'logo' ? LOGO_BUCKET : STORAGE_100_BUCKET;
+
+      // Ensure target bucket exists and is public
+      try {
+        const { error: createErr } = await supabase.storage.createBucket(targetBucket, { public: true });
+        if (createErr) {
+          const msg = String(createErr.message || createErr || '').toLowerCase();
+          if (!msg.includes('already exists') && !msg.includes('duplicate')) {
+            console.warn(`[cdn/upload] Bucket '${targetBucket}' create warning:`, createErr.message || createErr);
+          }
+        }
+      } catch (e) {
+        console.warn(`[cdn/upload] Bucket '${targetBucket}' create attempt warning:`, e?.message || e);
+      }
+
+      // Verify the bucket exists
+      let bucketExists = false;
+      try {
+        const { data, error: getErr } = await supabase.storage.getBucket(targetBucket);
+        if (data && !getErr) bucketExists = true;
+      } catch (_) {}
+      if (!bucketExists) {
+        const err = new Error(
+          `Supabase bucket '${targetBucket}' does not exist.\n\n` +
+          `FIX: Create a public bucket named '${targetBucket}' in your Supabase Dashboard → Storage → "New bucket".`
+        );
+        err.status = 503;
+        throw err;
+      }
+
+      const match = dataUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+      const mime = match[1].toLowerCase();
+      const base64Str = match[2];
+      const inputBuffer = Buffer.from(base64Str, 'base64');
+      const resizedBuffer = await resizeTo100(inputBuffer);
+      const ext = mime.includes('png') ? 'png' : 'jpg';
+      const safeOwner = String(ownerId).replace(/[^a-z0-9_-]/gi, '');
+      const ts = Date.now();
+      const rand = Math.random().toString(36).slice(2, 8);
+      const basePath = `${safeOwner}/${ts}-${rand}`;
+      const path = `${basePath}-100.${ext}`;
+
+      const { error: uploadErr } = await supabase.storage
+        .from(targetBucket)
+        .upload(path, resizedBuffer, {
+          contentType: 'image/jpeg',
+          upsert: false,
+          cacheControl: '31536000',
+        });
+      if (uploadErr) {
+        const detail = uploadErr?.message || uploadErr?.error || JSON.stringify(uploadErr);
+        throw new Error(`100px upload failed: ${detail}`);
+      }
+
+      const { data: pub } = supabase.storage.from(targetBucket).getPublicUrl(path);
+      return res.json({ ok: true, message: 'Uploaded 100px image.', url: pub.publicUrl });
+    }
+
+    // Default: HD and thumbnail processing
     const { hd, thumb } = await processAndUploadToCdn(dataUrl, ownerId);
 
-    return res.json({
-      ok: true,
-      message: 'Uploaded to Supabase CDN.',
-      hd,
-      thumb,
-    });
+    // Also create and upload 100px icon for thumbnails/icons
+    let iconUrl = '';
+    try {
+      const iconMatch = dataUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+      if (iconMatch) {
+        const iconBase64 = iconMatch[2];
+        const iconBuffer = Buffer.from(iconBase64, 'base64');
+        const iconResized = await resizeTo100(iconBuffer);
+        const iconExt = iconMatch[1].toLowerCase().includes('png') ? 'png' : 'jpg';
+        const safeOwner = String(ownerId).replace(/[^a-z0-9_-]/gi, '');
+        const iconTs = Date.now();
+        const iconRand = Math.random().toString(36).slice(2, 8);
+        const iconPath = `${safeOwner}/${iconTs}-${iconRand}-100.${iconExt}`;
+
+        const { error: iconUploadErr } = await supabase.storage
+          .from(STORAGE_100_BUCKET)
+          .upload(iconPath, iconResized, {
+            contentType: 'image/jpeg',
+            upsert: false,
+            cacheControl: '31536000',
+          });
+        if (!iconUploadErr) {
+          const { data: iconPub } = supabase.storage.from(STORAGE_100_BUCKET).getPublicUrl(iconPath);
+          iconUrl = iconPub?.publicUrl || '';
+        }
+      }
+    } catch (iconErr) {
+      console.warn('[cdn/upload] 100px icon upload failed (non-fatal):', iconErr?.message || iconErr);
+    }
+
+    return res.json({ ok: true, message: 'Uploaded to Supabase CDN.', hd, thumb, icon: iconUrl });
   } catch (error) {
     return handleError(res, error);
   }
@@ -1126,7 +1215,7 @@ app.post('/api/bookings', requireAuth, writeLimiter, async (req, res) => {
       ownerId: venue.ownerId,
       eventDate,
       guests: req.body.guests || null,
-      amount: venue.priceWithGst || venue.basePrice || 0,
+      amount: req.body.amount ?? venue.priceWithGst ?? venue.basePrice ?? 0,
       status: 'pending',
       bookedAt: nowIso(),
     });

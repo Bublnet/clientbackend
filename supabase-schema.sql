@@ -38,10 +38,15 @@ create table if not exists public.venues (
   "contactedAt" timestamptz,
   "submittedAt" timestamptz not null default now(),
   "updatedAt" timestamptz not null default now(),
-  "approvedAt" timestamptz
+  "approvedAt" timestamptz,
+  "reviewedBy" text
 );
 
 alter table public.venues add column if not exists "ownerEmail" text;
+alter table public.venues add column if not exists "reviewedBy" text;
+alter table public.venues add column if not exists "coverImage" text not null default '';
+alter table public.venues add column if not exists phone text not null default '';
+alter table public.venues add column if not exists "altPhone" text;
 
 create index if not exists venues_status_idx on public.venues (status);
 create index if not exists venues_owner_id_idx on public.venues ("ownerId");
@@ -142,3 +147,54 @@ create policy profiles_read_self on public.profiles
   for select to authenticated using (id = auth.uid()::text);
 
 drop policy if exists profiles_update_self on public.profiles;
+
+create table if not exists public.activity_logs (
+  id uuid primary key default gen_random_uuid(),
+  actor_id text not null,
+  actor_name text not null default '',
+  actor_role text not null default '',
+  action text not null,
+  target_type text not null default '',
+  target_id text,
+  target_name text,
+  details jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists activity_logs_actor_idx on public.activity_logs (actor_id);
+create index if not exists activity_logs_action_idx on public.activity_logs (action);
+create index if not exists activity_logs_created_idx on public.activity_logs (created_at desc);
+
+create table if not exists public.bookings (
+  id uuid primary key default gen_random_uuid(),
+  "venueId" text,
+  "venueName" text not null default '',
+  "customerName" text not null default '',
+  "userId" text,
+  "customerPhone" text,
+  "ownerId" text,
+  "ownerName" text,
+  "ownerPhone" text,
+  "venueAddress" text,
+  amount numeric(14,2) not null default 0,
+  guests integer,
+  status text not null default 'pending',
+  "paymentStatus" text not null default 'unpaid',
+  "ticketCode" text,
+  "ticketImage" text,
+  "verificationToken" text,
+  "qrPayload" text,
+  "ownerVerifiedAt" timestamptz,
+  "bookedAt" text not null default '',
+  "eventDate" text not null default '',
+  "paidAt" timestamptz,
+  "confirmedAt" timestamptz,
+  "receiptUrl" text,
+  "updatedAt" timestamptz
+);
+
+alter table public.bookings add column if not exists "updatedAt" timestamptz;
+create index if not exists bookings_user_id_idx on public.bookings ("userId");
+create index if not exists bookings_venue_id_idx on public.bookings ("venueId");
+create index if not exists bookings_event_date_idx on public.bookings ("eventDate");
+create index if not exists bookings_status_idx on public.bookings (status);

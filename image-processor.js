@@ -15,6 +15,8 @@ import supabaseDefault from './supabase.client.js';
  */
 
 export const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'bublnetorg';
+export const STORAGE_100_BUCKET = process.env.SUPABASE_100_BUCKET || '100bublnet';
+export const LOGO_BUCKET = process.env.SUPABASE_LOGO_BUCKET || 'logos';
 
 // Toggle this to false when you have a real Supabase bucket configured.
 export const MOCK_CDN = false;
@@ -54,12 +56,24 @@ export async function resizeForThumb(inputBuffer) {
 }
 
 /**
+ * Resize input to 100px square (tiny avatars/thumbnails).
+ */
+export async function resizeTo100(inputBuffer) {
+  const buffer = await sharp(inputBuffer)
+    .resize({ width: 100, height: 100, fit: 'cover' })
+    .jpeg({ quality: 70, mozjpeg: true })
+    .toBuffer();
+
+  return buffer;
+}
+
+/**
  * Core function: takes a data: URL (from Flutter picker), processes + uploads both versions.
  * Returns the public CDN URLs.
  *
  * supabaseClient param allows injection for unit tests (mock storage).
  */
-export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseClient = supabaseDefault) {
+export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseClient = supabaseDefault, bucketName = null) {
   if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) {
     throw new Error('Invalid dataUrl');
   }
@@ -92,7 +106,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     };
   }
 
-  const bucket = STORAGE_BUCKET;
+  const bucket = bucketName || STORAGE_BUCKET;
 
   // Best-effort auto-create (service role). Many projects hit RLS quirks on createBucket,
   // so we treat it as optional and do a hard existence check afterwards.
@@ -142,6 +156,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
   const rand = Math.random().toString(36).slice(2, 8);
   const basePath = `${safeOwner}/${ts}-${rand}`;
 
+  const targetBucket = bucket;
   const hdPath = `${basePath}-hd.${ext}`;
   const thumbPath = `${basePath}-thumb.${ext}`;
 
@@ -151,7 +166,7 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
 
   // Uploads (public URLs)
   const { error: hdErr } = await supabaseClient.storage
-    .from(bucket)
+    .from(targetBucket)
     .upload(hdPath, hdBuffer, {
       contentType: 'image/jpeg',
       upsert: false,
@@ -162,15 +177,15 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     const lower = detail.toLowerCase();
     if (lower.includes('not found') || lower.includes('bucket')) {
       throw new Error(
-        `HD upload failed because bucket '${bucket}' is missing. ` +
-        `Please create the public bucket '${bucket}' in your Supabase Dashboard (Storage).`
+        `HD upload failed because bucket '${targetBucket}' is missing. ` +
+        `Please create the public bucket '${targetBucket}' in your Supabase Dashboard (Storage).`
       );
     }
     throw new Error(`HD upload failed: ${detail}`);
   }
 
   const { error: thErr } = await supabaseClient.storage
-    .from(bucket)
+    .from(targetBucket)
     .upload(thumbPath, thumbBuffer, {
       contentType: 'image/jpeg',
       upsert: false,
@@ -188,8 +203,8 @@ export async function processAndUploadToCdn(dataUrl, ownerId = 'anon', supabaseC
     throw new Error(`Thumb upload failed: ${detail}`);
   }
 
-  const { data: hdPub } = supabaseClient.storage.from(bucket).getPublicUrl(hdPath);
-  const { data: thPub } = supabaseClient.storage.from(bucket).getPublicUrl(thumbPath);
+  const { data: hdPub } = supabaseClient.storage.from(targetBucket).getPublicUrl(hdPath);
+  const { data: thPub } = supabaseClient.storage.from(targetBucket).getPublicUrl(thumbPath);
 
   return {
     hd: hdPub.publicUrl,
