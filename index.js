@@ -24,7 +24,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4002;
-const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'http://localhost:4001';
+const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
