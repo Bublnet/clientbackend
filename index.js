@@ -1232,7 +1232,7 @@ app.post('/api/payments/create-order', requireAuth, async (req, res) => {
     const response = await fetch(`${PAYMENTS_URL}/api/create-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify({ ...req.body, userId: req.auth.user.id }),
     });
     const data = await response.json();
     res.status(response.status).json(data);
@@ -1243,14 +1243,28 @@ app.post('/api/payments/create-order', requireAuth, async (req, res) => {
 
 app.post('/api/payments/verify', requireAuth, async (req, res) => {
   try {
+    const paymentType = String((req.body && req.body.type) || '').toLowerCase();
     const response = await fetch(`${PAYMENTS_URL}/api/verify-payment`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify({ ...req.body, userId: req.auth.user.id }),
     });
     const data = await response.json();
     if (data && data.ok === true) {
-      // On successful payment, client can also hit activate-premium if applicable
+      if (paymentType === 'premium' || paymentType === 'subscription' || paymentType === 'premium_listing') {
+        const { error } = await supabase.from('profiles').update({
+          is_premium: true,
+          premium_since: nowIso(),
+          last_payment_id: data.paymentId || req.body.razorpay_payment_id || null,
+          updated_at: nowIso(),
+        }).eq('id', req.auth.user.id);
+        if (error) throw error;
+        data.data = {
+          ...(data.data || {}),
+          isPremium: true,
+          hasAccess: true,
+        };
+      }
     }
     res.status(response.status).json(data);
   } catch (error) {
@@ -1275,17 +1289,10 @@ app.post('/api/access/grant-ad', requireAuth, writeLimiter, async (req, res) => 
 });
 
 app.post('/api/access/activate-premium', requireAuth, async (req, res) => {
-  try {
-    const { error } = await supabase.from('profiles').update({
-      is_premium: true,
-      premium_since: nowIso(),
-      updated_at: nowIso(),
-    }).eq('id', req.auth.user.id);
-    if (error) throw error;
-    res.json({ ok: true, message: 'Premium activated.', data: { isPremium: true } });
-  } catch (error) {
-    return handleError(res, error);
-  }
+  res.status(410).json({
+    ok: false,
+    message: 'Premium activation must be completed through verified payment.',
+  });
 });
 
 // Profile (for manual location etc.)
