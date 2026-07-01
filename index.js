@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { analyticsMiddleware } from './analysis/analytics_logger.js';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -24,9 +25,19 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4002;
-const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
+
+const APP_MODE = process.env.APP_MODE || (process.env.NODE_ENV === 'production' ? 'production' : 'test');
+
+const PROD_FRONTEND_URL = 'https://dvenue.space';
+const TEST_FRONTEND_URL = 'http://localhost:8080';
+const FRONTEND_URL = APP_MODE === 'production' ? PROD_FRONTEND_URL : TEST_FRONTEND_URL;
+
+const PROD_PAYMENTS_URL = 'https://payments-brown-one.vercel.app';
+const TEST_PAYMENTS_URL = 'http://localhost:4001';
+const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || (APP_MODE === 'production' ? PROD_PAYMENTS_URL : TEST_PAYMENTS_URL);
+
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
-const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || 'https://dvenue.space';
+const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || FRONTEND_URL;
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
 const ADMIN_TOKEN_PATTERN = /^asdf_[A-Za-z0-9_-]{43}$/;
@@ -152,6 +163,9 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 // Raised limit to support base64 image data for single-image CDN uploads (picker compresses to ~1280px@72%).
 // Each /cdn/upload is one image at a time. Final /venues payload is small (only URLs).
 app.use(express.json({ limit: '15mb' }));
+
+// Track client backend traffic
+app.use(analyticsMiddleware('clientbackend'));
 
 // Global Data Logging Middleware
 const schemaReady = ensureSupabaseSchema();
