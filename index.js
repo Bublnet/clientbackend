@@ -225,12 +225,18 @@ async function firebasePasswordRequest(action, payload) {
     return { idToken: data.session.access_token, localId: data.user.id, email: data.user.email };
   }
   if (action === 'signUp') {
-    const { data, error } = await supabase.auth.signUp({ email: payload.email, password: payload.password });
+    const { data, error } = await supabase.auth.signUp({ 
+      email: payload.email, 
+      password: payload.password,
+      options: { emailRedirectTo: 'https://dvenue.space' }
+    });
     if (error) throw { status: 400, message: error.message };
     return { idToken: data.session?.access_token || '', localId: data.user.id, email: data.user.email };
   }
   if (action === 'sendOobCode') {
-    const { error } = await supabase.auth.resetPasswordForEmail(payload.email);
+    const { error } = await supabase.auth.resetPasswordForEmail(payload.email, {
+      redirectTo: 'https://dvenue.space'
+    });
     if (error) throw { status: 400, message: error.message };
     return {};
   }
