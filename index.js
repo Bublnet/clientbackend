@@ -26,6 +26,7 @@ const app = express();
 const PORT = process.env.PORT || 4002;
 const PAYMENTS_URL = process.env.PAYMENTS_SERVICE_URL || 'https://payments-brown-one.vercel.app';
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY;
+const AUTH_REDIRECT_URL = process.env.AUTH_REDIRECT_URL || 'https://dvenue.space';
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL;
 const ADMIN_LOGIN_IDENTIFIER = process.env.ADMIN_LOGIN_IDENTIFIER;
 const ADMIN_TOKEN_PATTERN = /^asdf_[A-Za-z0-9_-]{43}$/;
@@ -228,14 +229,14 @@ async function firebasePasswordRequest(action, payload) {
     const { data, error } = await supabase.auth.signUp({ 
       email: payload.email, 
       password: payload.password,
-      options: { emailRedirectTo: 'https://dvenue.space' }
+      options: { emailRedirectTo: AUTH_REDIRECT_URL }
     });
     if (error) throw { status: 400, message: error.message };
     return { idToken: data.session?.access_token || '', localId: data.user.id, email: data.user.email };
   }
   if (action === 'sendOobCode') {
     const { error } = await supabase.auth.resetPasswordForEmail(payload.email, {
-      redirectTo: 'https://dvenue.space'
+      redirectTo: AUTH_REDIRECT_URL
     });
     if (error) throw { status: 400, message: error.message };
     return {};
