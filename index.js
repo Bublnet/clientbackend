@@ -1105,6 +1105,13 @@ app.post('/api/cdn/upload', requireAuth, writeLimiter, async (req, res) => {
 
     // Size-specific handling: 100px icons or logos
     if (size === '100' || size === 'logo') {
+      if (MOCK_CDN) {
+        const mockSeed = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        const mockUrl = size === 'logo'
+            ? `https://picsum.photos/seed/${mockSeed}-logo/200/200`
+            : `https://picsum.photos/seed/${mockSeed}-100/100/100`;
+        return res.json({ ok: true, message: 'Mock uploaded logo/100 image.', url: mockUrl });
+      }
       const targetBucket = size === 'logo' ? LOGO_BUCKET : STORAGE_100_BUCKET;
 
       // Ensure target bucket exists and is public
