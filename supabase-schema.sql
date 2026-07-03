@@ -47,6 +47,9 @@ alter table public.venues add column if not exists "reviewedBy" text;
 alter table public.venues add column if not exists "coverImage" text not null default '';
 alter table public.venues add column if not exists phone text not null default '';
 alter table public.venues add column if not exists "altPhone" text;
+alter table public.venues add column if not exists description text not null default '';
+alter table public.venues add column if not exists "morningTime" text not null default '08:00 - 18:00';
+alter table public.venues add column if not exists "eveningTime" text not null default '19:00 - 07:00';
 
 create index if not exists venues_status_idx on public.venues (status);
 create index if not exists venues_owner_id_idx on public.venues ("ownerId");
