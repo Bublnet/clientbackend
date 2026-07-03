@@ -1036,28 +1036,40 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
     if (readError || !existing) {
       return res.status(404).json({ ok: false, message: 'Listing not found.' });
     }
-    if (existing.ownerId !== ownerScopeId(req.auth)) {
-      return res.status(403).json({ ok: false, message: 'You do not own this listing.' });
-    }
 
     const clientPayload = req.body || {};
+    const isStaff = ['admin', 'staff'].includes(req.auth.user.role);
+    const isAdminEdit = isStaff || clientPayload.modifiedByAdmin === true;
     const isCalendarOnly = clientPayload.calendarOnly === true;
-    if (req.auth.user.role === 'hoststaff' && !isCalendarOnly) {
+
+    if (!isAdminEdit && existing.ownerId !== ownerScopeId(req.auth)) {
+      return res.status(403).json({ ok: false, message: 'You do not own this listing.' });
+    }
+    if (!isAdminEdit && req.auth.user.role === 'hoststaff' && !isCalendarOnly) {
       return res.status(403).json({
         ok: false,
         message: 'Host staff may update prices and availability only.',
       });
     }
+
+    const preserveReviewState = isCalendarOnly || isAdminEdit;
     const update = cleanForFirestore({
       ...clientPayload,
       id: undefined,
       ownerId: undefined,
       ownerEmail: undefined,
       ownerName: undefined,
-      status: isCalendarOnly ? existing.status : 'pending',
-      verified: isCalendarOnly ? existing.verified : false,
-      verificationStatus: isCalendarOnly ? existing.verificationStatus : 'pending_contact',
+      status: preserveReviewState
+        ? (clientPayload.status ?? existing.status)
+        : 'pending',
+      verified: preserveReviewState
+        ? (clientPayload.verified ?? existing.verified)
+        : false,
+      verificationStatus: preserveReviewState
+        ? (clientPayload.verificationStatus ?? existing.verificationStatus)
+        : 'pending_contact',
       calendarOnly: undefined,
+      modifiedByAdmin: undefined,
       updatedAt: nowIso(),
       images: Array.isArray(clientPayload.images)
         ? clientPayload.images.filter((value) => typeof value === 'string' && value.startsWith('http'))
@@ -1070,15 +1082,24 @@ app.put('/api/venues/:id', requireAuth, writeLimiter, async (req, res) => {
         : '',
       specTable: sanitizeSpecTable(clientPayload.specTable),
     });
-    const { data: listing, error } = await supabase
+
+    let updateQuery = supabase
       .from('venues')
       .update(update)
-      .eq('id', req.params.id)
-      .eq('ownerId', ownerScopeId(req.auth))
-      .select()
-      .single();
+      .eq('id', req.params.id);
+    if (!isAdminEdit) {
+      updateQuery = updateQuery.eq('ownerId', ownerScopeId(req.auth));
+    }
+
+    const { data: listing, error } = await updateQuery.select().single();
     if (error) throw error;
-    res.json({ ok: true, message: 'Listing updated and returned to review.', listing: toListing(listing) });
+    res.json({
+      ok: true,
+      message: isAdminEdit
+        ? 'Listing updated by admin.'
+        : 'Listing updated and returned to review.',
+      listing: toListing(listing),
+    });
   } catch (error) {
     return handleError(res, error);
   }
