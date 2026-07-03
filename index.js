@@ -560,7 +560,21 @@ function cleanForFirestore(value) {
 
 function sanitizeSpecTable(raw) {
   if (!raw || typeof raw !== 'object') {
-    return { columns: ["Specification", "Details"], rows: [["Area", ""], ["Parking", ""]] };
+    return {
+      columns: ['Specification', 'Details'],
+      rows: [
+        ['Parking', ''],
+        ['CCTV', ''],
+        ['WiFi', ''],
+        ['Air Conditioning', ''],
+        ['TV', ''],
+        ['Sound System', ''],
+        ['Stage', ''],
+        ['Catering', ''],
+        ['Security', ''],
+        ['Turf', ''],
+      ],
+    };
   }
   return {
     columns: Array.isArray(raw.columns)
@@ -572,7 +586,13 @@ function sanitizeSpecTable(raw) {
             ? row.map(cell => (typeof cell === 'string' ? cell : String(cell || '')))
             : []
         )
-      : [["Area", ""], ["Parking", ""]]
+      : [
+        ['Parking', ''],
+        ['CCTV', ''],
+        ['WiFi', ''],
+        ['Air Conditioning', ''],
+        ['TV', ''],
+      ]
   };
 }
 
